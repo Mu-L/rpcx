@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,13 @@ var (
 	ErrServerUnavailable = errors.New("selected server is unavilable")
 )
 
+// Receipt represents the result of the service returned.
+type Receipt struct {
+	Address string
+	Reply   interface{}
+	Error   error
+}
+
 // XClient is an interface that used by client with service discovery and service governance.
 // One XClient is used only for one service. You should create multiple XClient for multiple services.
 type XClient interface {
@@ -48,6 +56,7 @@ type XClient interface {
 	Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
 	Broadcast(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
 	Fork(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
+	Inform(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) ([]Receipt, error)
 	SendRaw(ctx context.Context, r *protocol.Message) (map[string]string, []byte, error)
 	SendFile(ctx context.Context, fileName string, rateInBytesPerSecond int64, meta map[string]string) error
 	DownloadFile(ctx context.Context, requestFileName string, saveTo io.Writer, meta map[string]string) error
@@ -124,6 +133,9 @@ func NewXClient(servicePath string, failMode FailMode, selectMode SelectMode, di
 	}
 
 	pairs := discovery.GetServices()
+	sort.Slice(pairs, func(i, j int) bool {
+		return strings.Compare(pairs[i].Key, pairs[j].Key) <= 0
+	})
 	servers := make(map[string]string, len(pairs))
 	for _, p := range pairs {
 		servers[p.Key] = p.Value
@@ -159,6 +171,9 @@ func NewBidirectionalXClient(servicePath string, failMode FailMode, selectMode S
 	}
 
 	pairs := discovery.GetServices()
+	sort.Slice(pairs, func(i, j int) bool {
+		return strings.Compare(pairs[i].Key, pairs[j].Key) <= 0
+	})
 	servers := make(map[string]string, len(pairs))
 	for _, p := range pairs {
 		servers[p.Key] = p.Value
@@ -204,6 +219,9 @@ func (c *xClient) Auth(auth string) {
 // watch changes of service and update cached clients.
 func (c *xClient) watch(ch chan []*KVPair) {
 	for pairs := range ch {
+		sort.Slice(pairs, func(i, j int) bool {
+			return strings.Compare(pairs[i].Key, pairs[j].Key) <= 0
+		})
 		servers := make(map[string]string, len(pairs))
 		for _, p := range pairs {
 			servers[p.Key] = p.Value
@@ -382,21 +400,15 @@ func (c *xClient) generateClient(k, servicePath, serviceMethod string) (client R
 	return client, err
 }
 
-func (c *xClient) getCachedClientWithoutLock(k, servicePath, serviceMethod string) (RPCClient, error) {
+func (c *xClient) getCachedClientWithoutLock(k, servicePath, serviceMethod string) (RPCClient, bool, error) {
+	var needCallPlugin bool
 	client := c.findCachedClient(k, servicePath, serviceMethod)
 	if client != nil {
 		if !client.IsClosing() && !client.IsShutdown() {
-			return client, nil
+			return client, needCallPlugin, nil
 		}
 		c.deleteCachedClient(client, k, servicePath, serviceMethod)
 	}
-
-	var needCallPlugin bool
-	defer func() {
-		if needCallPlugin {
-			c.Plugins.DoClientConnected(client.GetConn())
-		}
-	}()
 
 	// double check
 	client = c.findCachedClient(k, servicePath, serviceMethod)
@@ -406,7 +418,7 @@ func (c *xClient) getCachedClientWithoutLock(k, servicePath, serviceMethod strin
 		})
 		c.slGroup.Forget(k)
 		if err != nil {
-			return nil, err
+			return nil, needCallPlugin, err
 		}
 
 		client = generatedClient.(RPCClient)
@@ -419,7 +431,7 @@ func (c *xClient) getCachedClientWithoutLock(k, servicePath, serviceMethod strin
 		c.setCachedClient(client, k, servicePath, serviceMethod)
 	}
 
-	return client, nil
+	return client, needCallPlugin, nil
 }
 
 func splitNetworkAndAddress(server string) (string, string) {
@@ -508,7 +520,11 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 	}
 
 	if share.Trace {
-		log.Debugf("selected a client %s for %s.%s, failMode: %v, args: %+v in case of xclient Call", client.RemoteAddr(), c.servicePath, serviceMethod, c.failMode, args)
+		if client != nil {
+			log.Debugf("selected a client %s for %s.%s, failMode: %v, args: %+v in case of xclient Call", client.RemoteAddr(), c.servicePath, serviceMethod, c.failMode, args)
+		} else {
+			log.Debugf("selected a client %s for %s.%s, failMode: %v, args: %+v in case of xclient Call", "nil", c.servicePath, serviceMethod, c.failMode, args)
+		}
 	}
 
 	var e error
@@ -709,7 +725,7 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 		for retries >= 0 {
 			retries--
 			if client != nil {
-				m, payload, err := client.SendRaw(ctx, r)
+				m, payload, err := c.wrapSendRaw(ctx, client, r)
 				if err == nil {
 					return m, payload, nil
 				}
@@ -736,7 +752,7 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 		for retries >= 0 {
 			retries--
 			if client != nil {
-				m, payload, err := client.SendRaw(ctx, r)
+				m, payload, err := c.wrapSendRaw(ctx, client, r)
 				if err == nil {
 					return m, payload, nil
 				}
@@ -761,7 +777,7 @@ func (c *xClient) SendRaw(ctx context.Context, r *protocol.Message) (map[string]
 		return nil, nil, err
 
 	default: // Failfast
-		m, payload, err := client.SendRaw(ctx, r)
+		m, payload, err := c.wrapSendRaw(ctx, client, r)
 		if err != nil {
 			if uncoverError(err) {
 				c.removeClient(k, r.ServicePath, r.ServiceMethod, client)
@@ -793,6 +809,28 @@ func (c *xClient) wrapCall(ctx context.Context, client RPCClient, serviceMethod 
 	return err
 }
 
+// wrapSendRaw wrap SendRaw to support client plugins
+func (c *xClient) wrapSendRaw(ctx context.Context, client RPCClient, r *protocol.Message) (map[string]string, []byte, error) {
+	if client == nil {
+		return nil, nil, ErrServerUnavailable
+	}
+
+	if share.Trace {
+		log.Debugf("call a client for %s.%s, args: %+v in case of xclient wrapSendRaw", c.servicePath, r.ServiceMethod, r.Payload)
+	}
+
+	ctx = share.NewContext(ctx)
+	c.Plugins.DoPreCall(ctx, c.servicePath, r.ServiceMethod, r.Payload)
+	m, payload, err := client.SendRaw(ctx, r)
+	c.Plugins.DoPostCall(ctx, c.servicePath, r.ServiceMethod, r.Payload, nil, err)
+
+	if share.Trace {
+		log.Debugf("called a client for %s.%s, args: %+v, err: %v in case of xclient wrapSendRaw", c.servicePath, r.ServiceMethod, r.Payload, err)
+	}
+
+	return m, payload, err
+}
+
 // Broadcast sends requests to all servers and Success only when all servers return OK.
 // FailMode and SelectMode are meanless for this method.
 // Please set timeout to avoid hanging.
@@ -812,17 +850,26 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 	}
 
 	ctx = setServerTimeout(ctx)
-
+	callPlugins := make([]RPCClient, 0, len(c.servers))
 	clients := make(map[string]RPCClient)
 	c.mu.Lock()
 	for k := range c.servers {
-		client, err := c.getCachedClientWithoutLock(k, c.servicePath, serviceMethod)
+		client, needCallPlugin, err := c.getCachedClientWithoutLock(k, c.servicePath, serviceMethod)
 		if err != nil {
 			continue
 		}
 		clients[k] = client
+		if needCallPlugin {
+			callPlugins = append(callPlugins, client)
+		}
 	}
 	c.mu.Unlock()
+
+	for i := range callPlugins {
+		if c.Plugins != nil {
+			c.Plugins.DoClientConnected(callPlugins[i].GetConn())
+		}
+	}
 
 	if len(clients) == 0 {
 		return ErrXClientNoServer
@@ -835,18 +882,27 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 		k := k
 		client := client
 		go func() {
-			e := c.wrapCall(ctx, client, serviceMethod, args, reply)
+			var clonedReply interface{}
+			if reply != nil {
+				clonedReply = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
+			}
+
+			e := c.wrapCall(ctx, client, serviceMethod, args, clonedReply)
 			done <- (e == nil)
 			if e != nil {
-				if uncoverError(err) {
+				if uncoverError(e) {
 					c.removeClient(k, c.servicePath, serviceMethod, client)
 				}
 				err.Append(e)
 			}
+
+			if e == nil && reply != nil && clonedReply != nil {
+				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem())
+			}
 		}()
 	}
 
-	timeout := time.After(time.Minute)
+	timeout := time.NewTimer(time.Minute)
 check:
 	for {
 		select {
@@ -855,11 +911,12 @@ check:
 			if l == 0 || !result { // all returns or some one returns an error
 				break check
 			}
-		case <-timeout:
+		case <-timeout.C:
 			err.Append(errors.New(("timeout")))
 			break check
 		}
 	}
+	timeout.Stop()
 
 	if err.Error() == "[]" {
 		return nil
@@ -885,17 +942,26 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 	}
 
 	ctx = setServerTimeout(ctx)
-
+	callPlugins := make([]RPCClient, 0, len(c.servers))
 	clients := make(map[string]RPCClient)
 	c.mu.Lock()
 	for k := range c.servers {
-		client, err := c.getCachedClientWithoutLock(k, c.servicePath, serviceMethod)
+		client, needCallPlugin, err := c.getCachedClientWithoutLock(k, c.servicePath, serviceMethod)
 		if err != nil {
 			continue
 		}
 		clients[k] = client
+		if needCallPlugin {
+			callPlugins = append(callPlugins, client)
+		}
 	}
 	c.mu.Unlock()
+
+	for i := range callPlugins {
+		if c.Plugins != nil {
+			c.Plugins.DoClientConnected(callPlugins[i].GetConn())
+		}
+	}
 
 	if len(clients) == 0 {
 		return ErrXClientNoServer
@@ -919,7 +985,7 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 			}
 			done <- (e == nil)
 			if e != nil {
-				if uncoverError(err) {
+				if uncoverError(e) {
 					c.removeClient(k, c.servicePath, serviceMethod, client)
 				}
 				err.Append(e)
@@ -927,7 +993,7 @@ func (c *xClient) Fork(ctx context.Context, serviceMethod string, args interface
 		}()
 	}
 
-	timeout := time.After(time.Minute)
+	timeout := time.NewTimer(time.Minute)
 check:
 	for {
 		select {
@@ -940,17 +1006,127 @@ check:
 				break check
 			}
 
-		case <-timeout:
+		case <-timeout.C:
 			err.Append(errors.New(("timeout")))
 			break check
 		}
 	}
+	timeout.Stop()
 
 	if err.Error() == "[]" {
 		return nil
 	}
 
 	return err
+}
+
+// Inform sends requests to all servers and returns all results from services.
+// FailMode and SelectMode are meanless for this method.
+// Please set timeout to avoid hanging.
+func (c *xClient) Inform(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) ([]Receipt, error) {
+	if c.isShutdown {
+		return nil, ErrXClientShutdown
+	}
+
+	if c.auth != "" {
+		metadata := ctx.Value(share.ReqMetaDataKey)
+		if metadata == nil {
+			metadata = map[string]string{}
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
+		}
+		m := metadata.(map[string]string)
+		m[share.AuthKey] = c.auth
+	}
+
+	ctx = setServerTimeout(ctx)
+	callPlugins := make([]RPCClient, 0, len(c.servers))
+	clients := make(map[string]RPCClient)
+	c.mu.Lock()
+	for k := range c.servers {
+		client, needCallPlugin, err := c.getCachedClientWithoutLock(k, c.servicePath, serviceMethod)
+		if err != nil {
+			continue
+		}
+		clients[k] = client
+		if needCallPlugin {
+			callPlugins = append(callPlugins, client)
+		}
+	}
+	c.mu.Unlock()
+
+	for i := range callPlugins {
+		if c.Plugins != nil {
+			c.Plugins.DoClientConnected(callPlugins[i].GetConn())
+		}
+	}
+
+	if len(clients) == 0 {
+		return nil, ErrXClientNoServer
+	}
+
+	var receiptsLock sync.Mutex
+	var receipts []Receipt
+
+	err := &ex.MultiError{}
+	l := len(clients)
+	done := make(chan bool, l)
+	for k, client := range clients {
+		k := k
+		client := client
+		go func() {
+			var clonedReply interface{}
+			if reply != nil {
+				clonedReply = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
+			}
+
+			e := c.wrapCall(ctx, client, serviceMethod, args, clonedReply)
+			done <- (e == nil)
+			if e != nil {
+				if uncoverError(e) {
+					c.removeClient(k, c.servicePath, serviceMethod, client)
+				}
+				err.Append(e)
+			}
+			if e == nil && reply != nil && clonedReply != nil {
+				reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem())
+			}
+
+			addr := k
+			ss := strings.SplitN(k, "@", 2)
+			if len(ss) == 2 {
+				addr = ss[1]
+			}
+			receiptsLock.Lock()
+
+			receipts = append(receipts, Receipt{
+				Address: addr,
+				Reply:   clonedReply,
+				Error:   err,
+			})
+			receiptsLock.Unlock()
+		}()
+	}
+
+	timeout := time.NewTimer(time.Minute)
+check:
+	for {
+		select {
+		case <-done:
+			l--
+			if l == 0 { // all returns or some one returns an error
+				break check
+			}
+		case <-timeout.C:
+			err.Append(errors.New(("timeout")))
+			break check
+		}
+	}
+	timeout.Stop()
+
+	if err.Error() == "[]" {
+		return receipts, nil
+	}
+	return receipts, err
 }
 
 // SendFile sends a local file to the server.
@@ -961,6 +1137,8 @@ func (c *xClient) SendFile(ctx context.Context, fileName string, rateInBytesPerS
 	if err != nil {
 		return err
 	}
+
+	defer file.Close()
 
 	fi, err := os.Stat(fileName)
 	if err != nil {

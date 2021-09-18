@@ -36,6 +36,9 @@ const (
 	ReaderBuffsize = 1024
 	// WriterBuffsize is used for bufio writer.
 	WriterBuffsize = 1024
+
+	// WriteChanSize is used for response.
+	WriteChanSize = 1024 * 1024
 )
 
 // contextKey is a value for use with context.WithValue. It's used as
@@ -61,6 +64,8 @@ var (
 	HttpConnContextKey = &contextKey{"http-conn"}
 )
 
+type Handler func(ctx *Context) error
+
 // Server is rpcx server that use TCP or UDP.
 type Server struct {
 	ln                 net.Listener
@@ -69,9 +74,12 @@ type Server struct {
 	gatewayHTTPServer  *http.Server
 	DisableHTTPGateway bool // should disable http invoke or not.
 	DisableJSONRPC     bool // should disable json rpc or not.
+	AsyncWrite         bool // set true if your server only serves few clients
 
 	serviceMapMu sync.RWMutex
 	serviceMap   map[string]*service
+
+	router map[string]Handler
 
 	mu         sync.RWMutex
 	activeConn map[net.Conn]struct{}
@@ -96,6 +104,8 @@ type Server struct {
 	AuthFunc func(ctx context.Context, req *protocol.Message, token string) error
 
 	handlerMsgNum int32
+
+	HandleServiceError func(error)
 }
 
 // NewServer returns a server.
@@ -106,6 +116,8 @@ func NewServer(options ...OptionFn) *Server {
 		activeConn: make(map[net.Conn]struct{}),
 		doneChan:   make(chan struct{}),
 		serviceMap: make(map[string]*service),
+		router:     make(map[string]Handler),
+		AsyncWrite: true,
 	}
 
 	for _, op := range options {
@@ -126,6 +138,10 @@ func (s *Server) Address() net.Addr {
 		return nil
 	}
 	return s.ln.Addr()
+}
+
+func (s *Server) AddHandler(servicePath, serviceMethod string, handler func(*Context) error) {
+	s.router[servicePath+"."+serviceMethod] = handler
 }
 
 // ActiveClientConn returns active connections.
@@ -299,7 +315,7 @@ func (s *Server) serveListener(ln net.Listener) error {
 
 		conn, ok := s.Plugins.DoPostConnAccept(conn)
 		if !ok {
-			closeChannel(s, conn)
+			conn.Close()
 			continue
 		}
 
@@ -344,6 +360,11 @@ func (s *Server) serveByWS(ln net.Listener, rpcPath string) {
 }
 
 func (s *Server) serveConn(conn net.Conn) {
+	if s.isShutdown() {
+		s.closeConn(conn)
+		return
+	}
+
 	defer func() {
 		if err := recover(); err != nil {
 			const size = 64 << 10
@@ -355,22 +376,13 @@ func (s *Server) serveConn(conn net.Conn) {
 			buf = buf[:ss]
 			log.Errorf("serving %s panic error: %s, stack:\n %s", conn.RemoteAddr(), err, buf)
 		}
+
 		if share.Trace {
 			log.Debugf("server closed conn: %v", conn.RemoteAddr().String())
 		}
 
-		s.mu.Lock()
-		delete(s.activeConn, conn)
-		s.mu.Unlock()
-		conn.Close()
-
-		s.Plugins.DoPostConnClose(conn)
+		s.closeConn(conn)
 	}()
-
-	if isShutdown(s) {
-		closeChannel(s, conn)
-		return
-	}
 
 	if tlsConn, ok := conn.(*tls.Conn); ok {
 		if d := s.readTimeout; d != 0 {
@@ -387,9 +399,15 @@ func (s *Server) serveConn(conn net.Conn) {
 
 	r := bufio.NewReaderSize(conn, ReaderBuffsize)
 
+	var writeCh chan *[]byte
+	if s.AsyncWrite {
+		writeCh = make(chan *[]byte, WriteChanSize)
+		defer close(writeCh)
+		go s.serveAsyncWrite(conn, writeCh)
+	}
+
 	for {
-		if isShutdown(s) {
-			closeChannel(s, conn)
+		if s.isShutdown() {
 			return
 		}
 
@@ -402,6 +420,8 @@ func (s *Server) serveConn(conn net.Conn) {
 
 		req, err := s.readRequest(ctx, r)
 		if err != nil {
+			protocol.FreeMsg(req)
+
 			if err == io.EOF {
 				log.Infof("client has closed this connection: %s", conn.RemoteAddr().String())
 			} else if strings.Contains(err.Error(), "use of closed network connection") {
@@ -437,8 +457,12 @@ func (s *Server) serveConn(conn net.Conn) {
 				handleError(res, err)
 				s.Plugins.DoPreWriteResponse(ctx, req, res, err)
 				data := res.EncodeSlicePointer()
-				_, err := conn.Write(*data)
-				protocol.PutData(data)
+				if s.AsyncWrite {
+					writeCh <- data
+				} else {
+					conn.Write(*data)
+					protocol.PutData(data)
+				}
 				s.Plugins.DoPostWriteResponse(ctx, req, res, err)
 				protocol.FreeMsg(res)
 			} else {
@@ -453,6 +477,12 @@ func (s *Server) serveConn(conn net.Conn) {
 			continue
 		}
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// maybe panic because the writeCh is closed.
+				}
+			}()
+
 			atomic.AddInt32(&s.handlerMsgNum, 1)
 			defer atomic.AddInt32(&s.handlerMsgNum, -1)
 
@@ -460,8 +490,13 @@ func (s *Server) serveConn(conn net.Conn) {
 				s.Plugins.DoHeartbeatRequest(ctx, req)
 				req.SetMessageType(protocol.Response)
 				data := req.EncodeSlicePointer()
-				conn.Write(*data)
-				protocol.PutData(data)
+				if s.AsyncWrite {
+					writeCh <- data
+				} else {
+					conn.Write(*data)
+					protocol.PutData(data)
+				}
+				protocol.FreeMsg(req)
 				return
 			}
 
@@ -479,9 +514,26 @@ func (s *Server) serveConn(conn net.Conn) {
 			if share.Trace {
 				log.Debugf("server handle request %+v from conn: %v", req, conn.RemoteAddr().String())
 			}
+
+			// first use handler
+			if handler, ok := s.router[req.ServicePath+"."+req.ServiceMethod]; ok {
+				sctx := NewContext(ctx, conn, req, writeCh)
+				err := handler(sctx)
+				if err != nil {
+					log.Errorf("[handler internal error]: servicepath: %s, servicemethod, err: %v", req.ServicePath, req.ServiceMethod, err)
+				}
+
+				return
+			}
+
+			//
 			res, err := s.handleRequest(ctx, req)
 			if err != nil {
-				log.Warnf("rpcx: failed to handle request: %v", err)
+				if s.HandleServiceError != nil {
+					s.HandleServiceError(err)
+				} else {
+					log.Warnf("rpcx: failed to handle request: %v", err)
+				}
 			}
 
 			s.Plugins.DoPreWriteResponse(ctx, req, res, err)
@@ -503,8 +555,13 @@ func (s *Server) serveConn(conn net.Conn) {
 					res.SetCompressType(req.CompressType())
 				}
 				data := res.EncodeSlicePointer()
-				conn.Write(*data)
-				protocol.PutData(data)
+				if s.AsyncWrite {
+					writeCh <- data
+				} else {
+					conn.Write(*data)
+					protocol.PutData(data)
+				}
+
 			}
 			s.Plugins.DoPostWriteResponse(ctx, req, res, err)
 
@@ -515,6 +572,21 @@ func (s *Server) serveConn(conn net.Conn) {
 			protocol.FreeMsg(req)
 			protocol.FreeMsg(res)
 		}()
+	}
+}
+
+func (s *Server) serveAsyncWrite(conn net.Conn, writeCh chan *[]byte) {
+	for {
+		select {
+		case <-s.doneChan:
+			return
+		case data := <-writeCh:
+			if data == nil {
+				return
+			}
+			conn.Write(*data)
+			protocol.PutData(data)
+		}
 	}
 }
 
@@ -538,15 +610,18 @@ func parseServerTimeout(ctx *share.Context, req *protocol.Message) context.Cance
 	return cancel
 }
 
-func isShutdown(s *Server) bool {
+func (s *Server) isShutdown() bool {
 	return atomic.LoadInt32(&s.inShutdown) == 1
 }
 
-func closeChannel(s *Server, conn net.Conn) {
+func (s *Server) closeConn(conn net.Conn) {
 	s.mu.Lock()
 	delete(s.activeConn, conn)
 	s.mu.Unlock()
+
 	conn.Close()
+
+	s.Plugins.DoPostConnClose(conn)
 }
 
 func (s *Server) readRequest(ctx context.Context, r io.Reader) (req *protocol.Message, err error) {
@@ -604,7 +679,8 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 		return handleError(res, err)
 	}
 
-	argv := argsReplyPools.Get(mtype.ArgType)
+	// get a argv object from object pool
+	argv := reflectTypePools.Get(mtype.ArgType)
 
 	codec := share.Codecs[req.SerializeType()]
 	if codec == nil {
@@ -617,11 +693,13 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 		return handleError(res, err)
 	}
 
-	replyv := argsReplyPools.Get(mtype.ReplyType)
+	// and get a reply object from object pool
+	replyv := reflectTypePools.Get(mtype.ReplyType)
 
 	argv, err = s.Plugins.DoPreCall(ctx, serviceName, methodName, argv)
 	if err != nil {
-		argsReplyPools.Put(mtype.ReplyType, replyv)
+		// return reply to object pool
+		reflectTypePools.Put(mtype.ReplyType, replyv)
 		return handleError(res, err)
 	}
 
@@ -635,29 +713,32 @@ func (s *Server) handleRequest(ctx context.Context, req *protocol.Message) (res 
 		replyv, err = s.Plugins.DoPostCall(ctx, serviceName, methodName, argv, replyv)
 	}
 
-	argsReplyPools.Put(mtype.ArgType, argv)
+	// return argc to object pool
+	reflectTypePools.Put(mtype.ArgType, argv)
+
 	if err != nil {
 		if replyv != nil {
 			data, err := codec.Encode(replyv)
-			argsReplyPools.Put(mtype.ReplyType, replyv)
+			// return reply to object pool
+			reflectTypePools.Put(mtype.ReplyType, replyv)
 			if err != nil {
 				return handleError(res, err)
 			}
 			res.Payload = data
 		}
-		argsReplyPools.Put(mtype.ReplyType, replyv)
 		return handleError(res, err)
 	}
 
 	if !req.IsOneway() {
 		data, err := codec.Encode(replyv)
-		argsReplyPools.Put(mtype.ReplyType, replyv)
+		// return reply to object pool
+		reflectTypePools.Put(mtype.ReplyType, replyv)
 		if err != nil {
 			return handleError(res, err)
 		}
 		res.Payload = data
 	} else if replyv != nil {
-		argsReplyPools.Put(mtype.ReplyType, replyv)
+		reflectTypePools.Put(mtype.ReplyType, replyv)
 	}
 
 	if share.Trace {
@@ -687,7 +768,7 @@ func (s *Server) handleRequestForFunction(ctx context.Context, req *protocol.Mes
 		return handleError(res, err)
 	}
 
-	argv := argsReplyPools.Get(mtype.ArgType)
+	argv := reflectTypePools.Get(mtype.ArgType)
 
 	codec := share.Codecs[req.SerializeType()]
 	if codec == nil {
@@ -700,7 +781,7 @@ func (s *Server) handleRequestForFunction(ctx context.Context, req *protocol.Mes
 		return handleError(res, err)
 	}
 
-	replyv := argsReplyPools.Get(mtype.ReplyType)
+	replyv := reflectTypePools.Get(mtype.ReplyType)
 
 	if mtype.ArgType.Kind() != reflect.Ptr {
 		err = service.callForFunction(ctx, mtype, reflect.ValueOf(argv).Elem(), reflect.ValueOf(replyv))
@@ -708,22 +789,22 @@ func (s *Server) handleRequestForFunction(ctx context.Context, req *protocol.Mes
 		err = service.callForFunction(ctx, mtype, reflect.ValueOf(argv), reflect.ValueOf(replyv))
 	}
 
-	argsReplyPools.Put(mtype.ArgType, argv)
+	reflectTypePools.Put(mtype.ArgType, argv)
 
 	if err != nil {
-		argsReplyPools.Put(mtype.ReplyType, replyv)
+		reflectTypePools.Put(mtype.ReplyType, replyv)
 		return handleError(res, err)
 	}
 
 	if !req.IsOneway() {
 		data, err := codec.Encode(replyv)
-		argsReplyPools.Put(mtype.ReplyType, replyv)
+		reflectTypePools.Put(mtype.ReplyType, replyv)
 		if err != nil {
 			return handleError(res, err)
 		}
 		res.Payload = data
 	} else if replyv != nil {
-		argsReplyPools.Put(mtype.ReplyType, replyv)
+		reflectTypePools.Put(mtype.ReplyType, replyv)
 	}
 
 	return res, nil

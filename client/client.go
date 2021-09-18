@@ -115,8 +115,7 @@ type Client struct {
 
 	Plugins PluginContainer
 
-	ServerMessageChanMu sync.RWMutex
-	ServerMessageChan   chan<- *protocol.Message
+	ServerMessageChan chan<- *protocol.Message
 }
 
 // NewClient returns a new Client with the option.
@@ -153,7 +152,7 @@ type Option struct {
 	RPCPath string
 	// ConnectTimeout sets timeout for dialing
 	ConnectTimeout time.Duration
-	// ReadTimeout sets max idle time for underlying net.Conns
+	// IdleTimeout sets max idle time for underlying net.Conns
 	IdleTimeout time.Duration
 
 	// BackupLatency is used for Failbackup mode. rpcx will sends another request if the first response doesn't return in BackupLatency time.
@@ -200,16 +199,12 @@ func (call *Call) done() {
 
 // RegisterServerMessageChan registers the channel that receives server requests.
 func (client *Client) RegisterServerMessageChan(ch chan<- *protocol.Message) {
-	client.ServerMessageChanMu.Lock()
 	client.ServerMessageChan = ch
-	client.ServerMessageChanMu.Unlock()
 }
 
 // UnregisterServerMessageChan removes ServerMessageChan.
 func (client *Client) UnregisterServerMessageChan() {
-	client.ServerMessageChanMu.Lock()
 	client.ServerMessageChan = nil
-	client.ServerMessageChanMu.Unlock()
 }
 
 // IsClosing client is closing or not.
@@ -398,6 +393,14 @@ func (client *Client) SendRaw(ctx context.Context, r *protocol.Message) (map[str
 		call.Metadata = rmeta
 	}
 	r.Metadata = rmeta
+
+	if _, ok := ctx.(*share.Context); !ok {
+		ctx = share.NewContext(ctx)
+	}
+
+	// TODO: should implement as plugin
+	client.injectOpenTracingSpan(ctx, call)
+	client.injectOpenCensusSpan(ctx, call)
 
 	done := make(chan *Call, 10)
 	call.Done = done
@@ -658,12 +661,8 @@ func (client *Client) input() {
 		switch {
 		case call == nil:
 			if isServerMessage {
-				client.ServerMessageChanMu.RLock()
 				if client.ServerMessageChan != nil {
-					client.ServerMessageChanMu.RUnlock()
-					go client.handleServerRequest(res)
-				} else {
-					client.ServerMessageChanMu.RUnlock()
+					client.handleServerRequest(res)
 				}
 				continue
 			}
@@ -712,9 +711,7 @@ func (client *Client) input() {
 	}
 	// Terminate pending calls.
 
-	client.ServerMessageChanMu.RLock()
 	if client.ServerMessageChan != nil {
-		client.ServerMessageChanMu.RUnlock()
 		req := protocol.NewMessage()
 		req.SetMessageType(protocol.Request)
 		req.SetMessageStatusType(protocol.Error)
@@ -725,9 +722,7 @@ func (client *Client) input() {
 			}
 		}
 		req.Metadata["server"] = client.Conn.RemoteAddr().String()
-		go client.handleServerRequest(req)
-	} else {
-		client.ServerMessageChanMu.RUnlock()
+		client.handleServerRequest(req)
 	}
 
 	client.mutex.Lock()
@@ -754,7 +749,7 @@ func (client *Client) input() {
 
 	client.mutex.Unlock()
 
-	if err != nil && err != io.EOF && !closing {
+	if err != nil && !closing {
 		log.Error("rpcx: client protocol error:", err)
 	}
 }
@@ -767,17 +762,14 @@ func (client *Client) handleServerRequest(msg *protocol.Message) {
 		}
 	}()
 
-	client.ServerMessageChanMu.RLock()
 	serverMessageChan := client.ServerMessageChan
-	client.ServerMessageChanMu.RUnlock()
-
-	t := time.NewTimer(5 * time.Second)
-	select {
-	case serverMessageChan <- msg:
-	case <-t.C:
-		log.Warnf("ServerMessageChan may be full so the server request %d has been dropped", msg.Seq())
+	if serverMessageChan != nil {
+		select {
+		case serverMessageChan <- msg:
+		default:
+			log.Warnf("ServerMessageChan may be full so the server request %d has been dropped", msg.Seq())
+		}
 	}
-	t.Stop()
 }
 
 func (client *Client) heartbeat() {
